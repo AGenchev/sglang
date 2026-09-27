@@ -5693,6 +5693,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             or hasattr(layer, "w13_weight_packed")
             or getattr(layer, "_v4_tk_path", False)
         )
+        # The full-GPU loader streams CPU-expert weights through
+        # wrapper.submit_write_weight_scale_to_buffer(), implemented by the
+        # Native MoE backends (RAWINT4/FP8/BF16/MXFP4/...) and, since
+        # ktransformers suggestion C, also by the LLAMAFILE backend (the C++
+        # LLAMA_MOE class now exposes write_weight_scale_to_buffer_task, and
+        # LlamafileMoEWrapper submits it). Wrappers without the method still
+        # skip the full-GPU path to avoid crashing the scheduler with
+        # AttributeError (issues 2108/2113).
+        _full_gpu_wrapper_capable = hasattr(
+            getattr(self, "wrapper", None), "submit_write_weight_scale_to_buffer"
+        )
+        if (
+            _full_gpu_fallback_supported
+            and not _full_gpu_wrapper_capable
+            and self.gpu_prefill_token_threshold > 0
+            and num_tokens >= self.gpu_prefill_token_threshold
+            and self.tp_rank == 0
+            and not getattr(self, "_full_gpu_capability_warned", False)
+        ):
+            self._full_gpu_capability_warned = True
+            logger.warning(
+                "KT full-GPU prefill skipped: --kt-method %s does not implement "
+                "submit_write_weight_scale_to_buffer (ktransformers issues "
+                "#2108/#2113). Chunks >= %d tokens use the hybrid CPU/GPU path.",
+                self.kt_config.method,
+                self.gpu_prefill_token_threshold,
+            )
         if (
             _glm5_next_fp8_required
             and _glm5_next_full_gpu_allowed
@@ -5707,6 +5734,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
             and _full_gpu_fallback_supported
+            and _full_gpu_wrapper_capable
         )
         _mxfp4_requested = _mxfp4_pipeline_requested(self)
         _mxfp4_signature = getattr(self, "_mxfp4_pipeline_signature", None)
