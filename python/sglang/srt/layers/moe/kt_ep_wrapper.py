@@ -3502,6 +3502,44 @@ def _any_tp_rank_true(local_value: bool) -> bool:
     return bool(status.item())
 
 
+
+_KT_WRAPPER_FULL_GPU_CAPABLE_CACHE: Dict[str, bool] = {}
+
+
+def _kt_wrapper_full_gpu_capable(method) -> bool:
+    """Rank-uniform check for the full-GPU prefill wrapper capability.
+
+    The KT wrapper is constructed on TP rank 0 only, so a plain
+    hasattr(method.wrapper, ...) is True on rank 0 and False on every other
+    rank.  That asymmetry desynchronizes the TP collectives inside
+    SharedFullContext._create_cpu_buffers: rank 0 enters the full-GPU
+    loader and blocks in a gloo all-reduce while its peers run the hybrid
+    CPU/GPU path and enqueue different NCCL collectives, deadlocking until
+    the watchdog kills the scheduler (ktransformers issue #2108).
+
+    Rank 0 decides and broadcasts the verdict over the gloo CPU group; the
+    result is cached per KT method because the wrapper class is uniform
+    across layers.
+    """
+    cache_key = str(getattr(method.kt_config, "method", ""))
+    cached = _KT_WRAPPER_FULL_GPU_CAPABLE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    local_capable = hasattr(
+        getattr(method, "wrapper", None), "submit_write_weight_scale_to_buffer"
+    )
+    if not dist.is_initialized() or get_tensor_model_parallel_world_size() == 1:
+        capable = local_capable
+    else:
+        flag = torch.tensor([int(local_capable)], dtype=torch.int32, device="cpu")
+        dist.broadcast(
+            flag, src=get_tp_group().first_rank, group=get_tp_group().cpu_group
+        )
+        capable = bool(flag.item())
+    _KT_WRAPPER_FULL_GPU_CAPABLE_CACHE[cache_key] = capable
+    return capable
+
+
 def _disable_mxfp4_layerwise_pipeline(signature: tuple, reason: str) -> None:
     _MXFP4_LAYERWISE_DISABLED_REASONS[signature] = reason
     gc.collect()
@@ -5701,9 +5739,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # LlamafileMoEWrapper submits it). Wrappers without the method still
         # skip the full-GPU path to avoid crashing the scheduler with
         # AttributeError (issues 2108/2113).
-        _full_gpu_wrapper_capable = hasattr(
-            getattr(self, "wrapper", None), "submit_write_weight_scale_to_buffer"
-        )
+        # The check is rank-uniform: rank 0 owns the only wrapper instance,
+        # evaluates the capability and broadcasts the verdict, because an
+        # asymmetric gate desynchronizes the SharedFullContext TP
+        # collectives (see _kt_wrapper_full_gpu_capable).
+        _full_gpu_wrapper_capable = _kt_wrapper_full_gpu_capable(self)
         if (
             _full_gpu_fallback_supported
             and not _full_gpu_wrapper_capable
