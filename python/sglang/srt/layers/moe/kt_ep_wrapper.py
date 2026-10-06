@@ -2499,7 +2499,7 @@ class SharedFullContext:
         torch.cuda.current_stream(device).wait_stream(post_stream)
 
     def _prepare_weight_bf16(self, wrapper, original_layer=None, gpu_experts_mask=None,
-                             logical_to_gpu_index=None):
+                             logical_to_gpu_index=None, layer_idx=None):
         """Prepare BF16/unquantized weights by writing from KT and copying to GPU.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
@@ -2565,6 +2565,85 @@ class SharedFullContext:
         post_stream = torch.cuda.Stream(device=device)
         # Events indexed by position in cpu_expert_ids
         events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
+        # --- Direct DMA from the pinned BF16 expert pool (KT_POOL_DIRECT_DMA=1).
+        # --- Per-rank pool-mmap -> GPU copies; no KT dequant fan-out, no CPU
+        # --- staging, no device barrier. Same bf16 bytes as the staged path.
+        if wrapper is not None and _kt_pool_direct_dma_usable(wrapper):
+            _w13_full = layer.w13_weight  # [num_experts, 2*gil, hidden]
+            _w2_full = layer.w2_weight  # [num_experts, hidden, gil]
+            _nexp = num_experts
+            _hidden = _w2_full.shape[1]
+            _gil = _w2_full.shape[2]
+            _full_inter = _gil * get_tensor_model_parallel_world_size()
+            _row0 = tp_rank * _gil
+            _elem = 2  # bf16
+            _pool_info = wrapper.kt_bf16_pool_info()
+            _geom_ok = (
+                int(_pool_info.get("n_experts", 0)) == _nexp
+                and int(_pool_info.get("hidden", 0)) == _hidden
+                and int(_pool_info.get("inter", 0)) == _full_inter
+            )
+            if not _geom_ok:
+                logger.warning_once(
+                    "KT pool direct-DMA disabled: pool geometry %s != model "
+                    "(nexp=%d hidden=%d inter=%d); using staged path",
+                    _pool_info,
+                    _nexp,
+                    _hidden,
+                    _full_inter,
+                )
+            else:
+                for idx, e in enumerate(cpu_expert_ids):
+                    src = wrapper.kt_bf16_pool_expert_source(
+                        layer_idx, _hidden, _full_inter, _nexp, int(e)
+                    )
+                    if not src.get("valid"):
+                        raise RuntimeError(
+                            f"KT pool direct-DMA: no pool source for layer "
+                            f"{layer_idx} expert {e}"
+                        )
+                    with torch.cuda.stream(copy_stream):
+                        for name, _, gpu_t in weight_infos:
+                            if name == "w13_weight":
+                                gate_t = torch.frombuffer(
+                                    _ctypes_raw(
+                                        src["gate_ptr"], _full_inter * _hidden * _elem
+                                    ),
+                                    dtype=torch.bfloat16,
+                                ).view(_full_inter, _hidden)
+                                up_t = torch.frombuffer(
+                                    _ctypes_raw(
+                                        src["up_ptr"], _full_inter * _hidden * _elem
+                                    ),
+                                    dtype=torch.bfloat16,
+                                ).view(_full_inter, _hidden)
+                                gpu_t[e][:_gil].copy_(
+                                    gate_t[_row0 : _row0 + _gil], non_blocking=True
+                                )
+                                gpu_t[e][_gil:].copy_(
+                                    up_t[_row0 : _row0 + _gil], non_blocking=True
+                                )
+                            elif name == "w2_weight":
+                                down_t = torch.frombuffer(
+                                    _ctypes_raw(
+                                        src["down_ptr"], _hidden * _full_inter * _elem
+                                    ),
+                                    dtype=torch.bfloat16,
+                                ).view(_hidden, _full_inter)
+                                gpu_t[e].copy_(
+                                    down_t[:, _row0 : _row0 + _gil], non_blocking=True
+                                )
+                            else:
+                                raise RuntimeError(
+                                    f"KT pool direct-DMA: unsupported weight {name}"
+                                )
+                    events[idx].record(copy_stream)
+                # Pipeline epilogue identical to the staged path
+                if cpu_expert_ids:
+                    with torch.cuda.stream(post_stream):
+                        post_stream.wait_event(events[-1])
+                        postprocess_expert(len(cpu_expert_ids) - 1)
+                return
 
         def postprocess_expert(idx):
             # BF16 doesn't need actual postprocessing (no repack/permute/transpose).
@@ -2721,7 +2800,7 @@ class SharedFullContext:
                                              logical_to_gpu_index)
         elif self._is_bf16_quant:
             self._prepare_weight_bf16(wrapper, original_layer, gpu_experts_mask,
-                                      logical_to_gpu_index)
+                                      logical_to_gpu_index, layer_idx=layer_idx)
         else:
             # INT4 Marlin format: write(e+1) || copy(e) || postprocess(e-1)
             self._prepare_weight_int4(wrapper)
@@ -3538,6 +3617,47 @@ def _kt_wrapper_full_gpu_capable(method) -> bool:
         capable = bool(flag.item())
     _KT_WRAPPER_FULL_GPU_CAPABLE_CACHE[cache_key] = capable
     return capable
+
+
+
+
+_KT_POOL_DIRECT_DMA_CACHE: Dict[int, bool] = {}
+
+
+def _ctypes_raw(ptr: int, nbytes: int):
+    """Wrap a raw host address as a ctypes byte buffer view (no copy)."""
+    import ctypes as _ct
+
+    return (_ct.c_ubyte * nbytes).from_address(ptr)
+
+
+def _kt_pool_direct_dma_usable(wrapper) -> bool:
+    """Verdict for direct DMA from the pinned BF16 expert pool.
+
+    Requires KT_POOL_DIRECT_DMA=1, a wrapper exposing kt_bf16_pool_expert_source,
+    and a pool that is enabled AND pinned (cudaHostRegister succeeded). Geometry
+    is verified per layer in _prepare_weight_bf16 against the real tensors.
+    Every rank evaluates the same facts locally (env + wrapper attrs +
+    kt_kernel_ext.kt_bf16_pool_info), so all TP ranks branch identically
+    without extra collectives. Cached per wrapper.
+    """
+    key = id(wrapper)
+    cached = _KT_POOL_DIRECT_DMA_CACHE.get(key)
+    if cached is not None:
+        return cached
+    usable = False
+    if os.environ.get("KT_POOL_DIRECT_DMA") == "1":
+        if wrapper is not None and hasattr(wrapper, "kt_bf16_pool_expert_source"):
+            try:
+                from kt_kernel_ext import kt_bf16_pool_info as _pool_info
+
+                info = _pool_info()
+                usable = bool(info.get("enabled") and info.get("pinned"))
+            except Exception as e:
+                logger.warning_once("KT pool direct-DMA probe failed: %s", e)
+                usable = False
+    _KT_POOL_DIRECT_DMA_CACHE[key] = usable
+    return usable
 
 
 def _disable_mxfp4_layerwise_pipeline(signature: tuple, reason: str) -> None:
