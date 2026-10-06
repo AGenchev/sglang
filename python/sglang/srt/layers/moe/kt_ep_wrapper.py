@@ -2521,6 +2521,7 @@ class SharedFullContext:
         tp_rank = get_tensor_model_parallel_rank()
         num_cpus = os.cpu_count()
         target_cpu = num_cpus - 1 - tp_rank
+        _bf16_saved_affinity = os.sched_getaffinity(0)
         os.sched_setaffinity(0, {target_cpu})
 
         layer = self.gpu_layer
@@ -2593,6 +2594,9 @@ class SharedFullContext:
                     _full_inter,
                 )
             else:
+                # Pool copies are worker-pool parallel; restore the full
+                # affinity mask the single-core pin above had dropped.
+                os.sched_setaffinity(0, _bf16_saved_affinity)
                 for idx, e in enumerate(cpu_expert_ids):
                     src = wrapper.kt_bf16_pool_expert_source(
                         layer_idx, _hidden, _full_inter, _nexp, int(e)
